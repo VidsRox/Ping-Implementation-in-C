@@ -124,18 +124,14 @@ int main(){
                 uint8_t *icmp = buffer + ip_header_length;
 
 
-                printf("got type: %d from: %s\n", icmp[0], inet_ntoa(sender.sin_addr));
-
-
                 if(icmp[0] == 0){
                     struct timespec end;
                     clock_gettime(CLOCK_MONOTONIC, &end);
 
                     double rtt = (end.tv_sec - start.tv_sec) * 1000.0 +
                                 (end.tv_nsec - start.tv_nsec) / 1000000.0;
-                    printf("RTT: %.3f ms\n", rtt);
-                    printf("ICMP reply received!\n");
-                    printf("from: %s\n", inet_ntoa(sender.sin_addr));
+                    printf("64 bytes from %s: icmp_seq=%d time=%.3f ms\n",
+                            inet_ntoa(sender.sin_addr), seq, rtt);
                     break;
                 }
         }
