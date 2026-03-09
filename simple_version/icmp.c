@@ -7,6 +7,8 @@
 #include <time.h>
 #include <errno.h>
 #include <unistd.h>
+#include <signal.h>
+#include <stdlib.h>
 
 
 //__attribute ((packed)) tells the compiler - don't add any padding,
@@ -40,8 +42,19 @@ uint16_t checksum(uint8_t *data, int length){
     return ~sum;
 }
 
+int packets_sent = 0;
+int packets_received=0;
+double rtt_min = 1e9, rtt_max, rtt_total;
+
+void handle_sigInt(int sig){
+   printf("%i packets transmitted, %i packets received, 0%% packet loss\n", packets_sent, packets_received);
+   printf("rtt min/avg/max = %.3f/%.3f/%.3f ms\n", rtt_min, rtt_total/packets_received, rtt_max); 
+   exit(0);
+}
+
 
 int main(){
+    signal(SIGINT, handle_sigInt);
     packet Packet = {0};
 
 
@@ -72,6 +85,8 @@ int main(){
 
     uint16_t seq = 1;
 
+    
+
     while(1){//outer loop- 1 ping per second
 
 //build packet, send, record start time
@@ -93,9 +108,11 @@ int main(){
             return 1;
         }
 
+        packets_sent++;
+
 
         uint8_t buffer[128];
-    
+
         struct sockaddr_in sender;
     
         socklen_t sender_len = sizeof(sender);
@@ -114,6 +131,8 @@ int main(){
                     }
                 }
 
+                packets_received++;
+
                 //To get just the bottom 4 bits we mask with 0x0F which is 00001111
                 uint8_t ihl = buffer[0] & 0x0F;
 
@@ -130,7 +149,12 @@ int main(){
 
                     double rtt = (end.tv_sec - start.tv_sec) * 1000.0 +
                                 (end.tv_nsec - start.tv_nsec) / 1000000.0;
-                    printf("64 bytes from %s: icmp_seq=%d time=%.3f ms\n",
+
+                    if(rtt < rtt_min) rtt_min = rtt;
+                    if(rtt > rtt_max) rtt_max = rtt;
+                    rtt_total += rtt;
+
+                    printf("64 bytes from %s: icmp_seq=%d time=%.3f ms\n\n",
                             inet_ntoa(sender.sin_addr), seq, rtt);
                     break;
                 }
