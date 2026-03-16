@@ -113,7 +113,7 @@ ping/
 
 ## Environment
 
-Developed on Ubuntu 24.04 in a VirtualBox VM. WSL2 is insufficient for this project - its NAT layer intercepts ICMP replies from internet addresses before raw sockets can receive them. Native Linux is required for raw socket work beyond loopback.
+Developed on Ubuntu 22.04 in a VirtualBox VM. WSL2 is insufficient for this project - its NAT layer intercepts ICMP replies from internet addresses before raw sockets can receive them. Native Linux is required for raw socket work beyond loopback.
 
 ---
 
