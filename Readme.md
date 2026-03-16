@@ -12,8 +12,8 @@ Most networking code hides the packet structure from you. A browser, a curl call
 
 This project removes every abstraction, one layer at a time:
 
-- **Part 1**: OS handles the IP header. You build ICMP manually.
-- **Part 2**: You build everything - ICMP, IP, and Ethernet - byte by byte.
+- **Part 1**: OS handles the IP header. We build ICMP manually.
+- **Part 2**: We build everything - ICMP, IP, and Ethernet - byte by byte.
 
 The goal isn't just a working ping. It's a mental model of what actually happens on the wire.
 
