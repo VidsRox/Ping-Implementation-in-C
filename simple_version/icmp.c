@@ -30,8 +30,8 @@ uint16_t checksum(uint8_t *data, int length){
 
 
     for(int i = 0; i < length; i += 2){
-    uint16_t chunk = *(uint16_t *)(data + i);  // read 2 bytes as-is from memory
-    sum += chunk;
+        uint16_t chunk = *(uint16_t *)(data + i);  // read 2 bytes as-is from memory
+        sum += chunk;
     }
 
 
