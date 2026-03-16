@@ -73,7 +73,7 @@ mkicmp()  →  logical icmp struct  →  eval_icmp()  →  raw wire bytes  →  
 
 Before starting Part 2, LeetCode #271 Encode and Decode Strings was studied specifically because length-prefix serialization - encoding structured data into a flat byte stream and recovering it - is exactly the pattern `eval_icmp()` implements.
 
-### Phase 6 - ICMP Layer ✅ Complete
+### ICMP Layer ✅ Complete
 
 - `type` enum: `unassigned`, `echo`, `echoreply`
 - `s_icmp` logical struct: `kind`, `identifier`, `seq_num`, `size`, `*data`
