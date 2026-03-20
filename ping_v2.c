@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <assert.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/time.h>
 
 #define packed __attribute__((packed))
 
@@ -84,8 +86,8 @@ uint16_t checksum(uint8_t *data, int length){
 
 //constructor for logical ip struct
 
-/*takes everything needed to describe an IP packet in convenient form — the protocol kind, 
-source address, destination address, and an identifier — and produces a heap-allocated ip 
+/*takes everything needed to describe an IP packet in convenient form - the protocol kind, 
+source address, destination address, and an identifier - and produces a heap-allocated ip 
 struct with all those values stored.*/
 ip *mkip(type kind, const uint8_t *src, const uint8_t *dst, uint16_t id_, uint16_t *cntptr){
     uint16_t id;
@@ -111,6 +113,7 @@ ip *mkip(type kind, const uint8_t *src, const uint8_t *dst, uint16_t id_, uint16
     pkt->dst = inet_addr((char *)dst);
     pkt->payload = (icmp *)0;
 
+//catches invalid destination addresses since inet_addr() returns 0 for "0.0.0.0" which is an invalid destination for a real ping.    
     if(!pkt->dst){
         free(pkt);
         return (ip *)0;
@@ -227,8 +230,8 @@ uint8_t *evalip(ip *pkt){
     rawpkt.flags = 0;
     rawpkt.id = htons(pkt->id);
 
-/*  ihl is the IP header length in 32-bit words — dividing sizeof(rawip) by 4 
-    gives you that count automatically rather than hardcoding it*/
+/*  ihl is the IP header length in 32-bit words - dividing sizeof(rawip) 
+    by 4 gives that count automatically rather than hardcoding it*/
     rawpkt.ihl = (sizeof(rawip)/4);
 
     length_le = 0;
@@ -332,11 +335,185 @@ void free_ip(ip *pkt){
     free(pkt);
 }
 
+/*a convenience function that creates and configures the raw socket, 
+returning the socket file descriptor. Everything that needs to happen 
+once before packets can be sent or received lives here.*/
+uint32_t setup(){
+   uint32_t s, one;
+   signed int tmp;
+   struct timeval tv;
+
+   tv.tv_sec = 2;
+   tv.tv_usec = 0;
+
+   one = (uint32_t)1;
+
+   //1 passed to socket() is IPPROTO_ICMP as a raw number
+   tmp = socket(AF_INET, SOCK_RAW, 1);
+   
+   if(tmp>2) s = (uint32_t)tmp;
+   else s = (uint32_t)0;
+
+/*SOL_IP means the option applies at the IP layer. 
+IP_HDRINCL with value 1 tells the kernel - 
+"I'm providing the complete IP header myself, don't add one." 
+Without this, the OS would prepend its own IP header on top of 
+the one in evalip(), producing a malformed double-header packet.*/   
+   setsockopt( (int)s, SOL_IP, IP_HDRINCL, (unsigned int *)&one, sizeof(uint32_t) );
+
+   setsockopt( (int)s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(struct timeval) );
+
+   return s;
+}
+
+bool sendip(uint32_t s, ip *pkt){
+    uint8_t *raw;
+    uint16_t n;
+    signed int ret;
+    struct sockaddr_in sock;
+
+    if(!s || !pkt) return false;
+
+/*  Zeroes the sockaddr_in struct before filling it in. This is important because uninitialized 
+    struct fields contain garbage - the OS might misinterpret them when routing the packet.*/
+    memset(&sock, 0 , sizeof(sock));
+
+/* evalip() takes the logical ip struct - which contains a pointer to a logical icmp struct - 
+   and produces a single flat byte buffer containing the complete wire-format packet: 
+   IP header, then ICMP header, then ICMP payload, all contiguous. 
+   raw now points to those bytes, ready to hand directly to sendto().*/    
+    raw = evalip(pkt);
+
+    n = sizeof(rawip) + sizeof(rawicmp) + pkt->payload->size;
+
+    sock.sin_addr.s_addr = (in_addr_t)pkt->dst;
+
+    ret = sendto( (int)s, raw, (int)n, 0 /*MSG_DONTWAIT*/, (const struct sockaddr *)&sock, sizeof(sock) );
+    free(raw);
+
+    if(ret<0)return false;
+    else return true;
+}
+
+ip *recvip(uint32_t s){
+    uint8_t buf[1600];
+    ip *ip_pkt;
+    rawip *raw_ip;
+    signed int ret;
+    uint16_t n;
+    uint8_t src[16], dst[16];
+    uint16_t id;
+    type kind;
+    uint16_t check_sum;
+    rawicmp *raw_icmp;
+    icmp *icmp_pkt;
+    type icmpkind;
+    uint16_t icmp_checksum;
+    uint16_t len;
+    uint8_t *tmp;
+    
+    if(!s) return (ip *)0;
+
+    //setting up the receive buffer
+    memset(&buf, 0, 1600);
+    ret = recvfrom((int)s, &buf, 1599, 0, 0, 0);
+
+    if(ret<0)return (ip *)0;
+    else n = (uint16_t)ret;
+
+    //cast to rawip* to read IP header fields
+    raw_ip = (rawip *)&buf;
+    id = ntohs(raw_ip->id);
+
+    //Extracting source and destination addresses
+    memset(&src, 0 ,16);
+    memset(&dst, 0, 16);
+
+    struct in_addr addr;
+    addr.s_addr = raw_ip->src;
+
+    tmp = inet_ntoa(addr);
+    len = strlen(tmp);
+    memcpy(&src, tmp, len);
+
+    struct in_addr addr2;
+    addr2.s_addr = raw_ip->dst;
+    
+    tmp = inet_ntoa(addr2);
+    len = strlen(tmp);
+    memcpy(&dst, tmp, len);
+
+    //verifying IP checksum
+    if(n%2)n++;
+
+    check_sum = checksum(buf, n);
+    if(check_sum){
+        fprintf(stderr, "Received packet with malformed checksum: 0x%.04hx\n", (int)raw_ip->checksum);
+        return(ip *)0;
+    }
+
+    //Determining the protocol
+    kind = (raw_ip->protocol == 1) ? L4icmp : unassigned;
+
+    if(kind != L4icmp){
+        fprintf(stderr, "Unsupported packet type received: 0x%.04hx\n", (int)raw_ip->protocol);
+        return(ip *)0;
+    }
+
+    //Build logical ip struct with mkip()
+    ip_pkt = mkip(kind, src, dst, id, 0);
+    n = n - sizeof(rawip);
+    if(!n){
+        ip_pkt->payload = (icmp *)0;
+        return ip_pkt;
+    } 
+
+    //Advancing past the IP header to find ICMP
+    raw_icmp = (rawicmp *)(buf + sizeof(rawip));
+    
+    //Determining ICMP type
+    if((raw_icmp->Type==8) && !raw_icmp->code) icmpkind = echo;
+    else if(!raw_icmp->Type && !raw_icmp->code) icmpkind = echoreply;
+    else icmpkind = unassigned;
+
+    if(icmpkind == unassigned) return recvip(s);//keep receiving until you get something meaningful
+
+    //Verifying the ICMP checksum
+    icmp_checksum = checksum((uint8_t *) raw_icmp, n);
+    if(icmp_checksum){
+        fprintf(stderr, "ICMP checksum failed: 0x%.04hx\n", (int) raw_icmp->checksum);
+        return (ip *)0;
+    }
+    
+    //Extracting the ICMP payload and building the logical ICMP struct
+    n = n-sizeof(rawicmp);
+    uint8_t *payload = NULL;
+    if(n > 0){
+        payload = malloc(n);
+        memset(payload, 0, n);
+        memcpy(payload, raw_icmp->data, n);
+    }
+
+    icmp_pkt = mkicmp(icmpkind, payload, n, ntohs(raw_icmp->identifier), ntohs(raw_icmp->seq_num));
+
+    //Attaching the payload and returning
+    if(!icmp_pkt) return ip_pkt;
+    else ip_pkt->payload = icmp_pkt;
+
+    return ip_pkt;
+}
+
 int main(){
     icmp *pkt = mkicmp(echo, "hello world", strlen("hello world"), 1, 1);
     ip *packet = mkip(L4icmp, "0.0.0.0", "8.8.8.8", 1, NULL);
     packet->payload = pkt;
-    showip("ip packet", packet);
-    free_icmp(pkt);
-    free_ip(packet);
+
+    uint32_t s = setup();
+    sendip(s, packet);
+
+    ip *reply = recvip(s);
+    if(reply){
+        showip("Received", reply);
+        free_ip(reply);
+    }
 }
