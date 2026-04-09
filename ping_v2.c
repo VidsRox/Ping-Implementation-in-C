@@ -440,7 +440,7 @@ void show_ether(uint8_t *id, ether *e){
         (uint8_t)((e->dst.addr >> 40) & 0xFF));
     printf("}\n");
     if(e->payload->payload)
-        showip("payload", e->payload->payload);
+        showip("payload", e->payload);
     return;
 }
 
@@ -473,6 +473,44 @@ uint32_t setup(){
     else      s = (uint32_t)0;
     setsockopt((int)s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(struct timeval));
     return s;
+}
+
+/* reads our own MAC address from the kernel via ioctl(SIOCGIFHWADDR).
+   Result comes back in ifr.ifr_hwaddr.sa_data as a 6-byte array - copied into
+   a uint64_t intermediate first since bit fields can't be passed to memcpy directly. */
+mac get_mac(uint32_t s, const char *ifname){
+    mac result;
+    struct ifreq ifr; /* two-way communication channel with the kernel via ioctl() */
+
+    memset(&result, 0, sizeof(mac));
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1); /* IFNAMSIZ=16, -1 leaves room for null terminator */
+    
+    if(ioctl((int)s, SIOCGIFHWADDR, &ifr) < 0) return result;
+
+    uint64_t tmp = 0;
+
+    memcpy(&tmp, ifr.ifr_hwaddr.sa_data, 6);
+    result.addr = tmp;
+    return result;
+}
+
+/* reads our own IPv4 address from the kernel via ioctl(SIOCGIFADDR).
+   Result comes back as a struct sockaddr - cast to sockaddr_in * to access
+   sin_addr.s_addr, which is already in network byte order. */
+uint32_t get_ip(uint32_t s, const char *ifname){
+    uint32_t result;
+    struct ifreq ifr; /* two-way communication channel with the kernel via ioctl() */
+
+    memset(&result, 0, sizeof(uint32_t));
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1); /* IFNAMSIZ=16, -1 leaves room for null terminator */
+    
+    if(ioctl((int)s, SIOCGIFADDR, &ifr) < 0) return result;
+
+    result = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
+
+    return result;
 }
 
 /* if2idx - resolves a network interface name to its kernel integer index.
@@ -692,20 +730,52 @@ ether *recv_frame(uint32_t s){
     return e;
 }
 
+
+/* 1. Open AF_PACKET socket
+   2. Discover our own MAC and IP via ioctl
+   3. ARP broadcast to discover gateway MAC (10.0.2.2)
+   4. Build icmp → ip → ether struct chain
+   5. Send complete Ethernet frame
+   6. Receive and display echo reply
+   7. Free both sent and received ether chains */
 int main(){
-    /* TODO: Phase 8 main() - wire everything together:
-       1. setup() - open AF_PACKET socket
-       2. get our own MAC and IP (needed for ARP sender fields)
-       3. send_arp() - broadcast ARP request for gateway (10.0.2.2)
-       4. recv_arp() - receive gateway MAC
-       5. mkicmp() + mkip() + mkether() - build full packet chain
-       6. sendframe() - send complete Ethernet frame
-       7. recv_frame() - receive echo reply
-       8. show_ether() - display result
-       9. free_ether() - clean up */
-    icmp *pkt   = mkicmp(echo, "hello world", strlen("hello world"), 1, 1);
-    ip *packet  = mkip(L4icmp, "0.0.0.0", "8.8.8.8", 1, NULL);
-    packet->payload = pkt;
-    uint32_t s  = setup();
-    /* sendip and recvip(s) removed - replaced by sendframe() and recv_frame() */
+    
+    uint32_t s;
+    mac my_mac, dst_mac;
+    uint32_t my_ip;
+    icmp *Icmp;
+    ip *Ip;
+    ether *src_ether, *recvd_ether;
+
+    s = setup();
+
+    my_mac = get_mac(s, "enp0s3");
+    my_ip = get_ip(s, "enp0s3");
+
+    uint32_t gw_ip = inet_addr("10.0.2.2");//ip address of gateway
+    send_arp(s, &my_mac, &my_ip, &gw_ip);
+
+    dst_mac = recv_arp(s);
+
+    Icmp = mkicmp(echo, (uint8_t *)"hello world", strlen("hello world"), 1, 1);
+
+    struct in_addr my_addr;
+    my_addr.s_addr = my_ip;
+    char *src_str = inet_ntoa(my_addr);
+
+    Ip = mkip(L4icmp, (uint8_t *)src_str, "8.8.8.8", 1, NULL);
+    Ip->payload = Icmp;
+
+    src_ether = mkether(tIP, &my_mac, &dst_mac);
+    src_ether->payload = Ip;
+
+    sendframe(s, src_ether);
+    recvd_ether = recv_frame(s);
+
+    if(recvd_ether){
+        show_ether((uint8_t *)"Received", recvd_ether);
+        free_ether(src_ether);
+        free_ether(recvd_ether);
+    }
+
 }
