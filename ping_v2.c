@@ -8,6 +8,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
+
 
 #define packed __attribute__((packed))
 
@@ -20,6 +25,26 @@ typedef enum{
     L4tcp,
     L4udp
 } type;
+
+
+//Saw both of these as ETH_P_IP and ETH_P_ARP in the Linux kernel source.
+typedef enum{
+    unset = 0,
+    tIP = 0x0800,/*tIP = 0x0800 is the EtherType value that tells the receiving network card 
+                        "the payload inside this frame is an IPv4 packet." */
+    
+    tARP = 0x0806 /*tARP = 0x0806 is needed specifically for ARP resolution, where we'll send a frame 
+                           whose payload is an ARP request rather than an IP packet. */
+} packed ethertype;
+
+
+/*A MAC address is 6 bytes - 48 bits. Storing it as the lower 48 bits 
+of a uint64_t lets us pass it around as a single integer rather than 
+an array of 6 bytes, which makes comparison and assignment cleaner. 
+The :48 bit field constrains it so the upper 16 bits are always zero.*/
+typedef struct s_mac{
+    uint64_t addr:48;
+} packed mac;
 
 //logical struct-
 typedef struct s_icmp{
@@ -51,7 +76,7 @@ typedef struct s_ip{
 } packed ip;
 
 typedef struct s_rawip{
-    uint8_t ihl:4;
+    uint8_t ihl:4;//IP header length in 32 bit words
     uint8_t version:4;
     uint8_t ecn:2;
     uint8_t dscp:6;
@@ -66,6 +91,19 @@ typedef struct s_rawip{
     uint32_t dst;
     uint8_t options[];
 } packed rawip;
+
+typedef struct s_ether{
+    ethertype protocol;
+    mac src;
+    mac dst;
+    ip *payload;
+} packed ether;
+
+typedef struct s_rawether{
+    mac dst;       // destination first on wire
+    mac src;       // then source
+    uint16_t type; // EtherType last
+} packed rawether;
 
 uint16_t checksum(uint8_t *data, int length){
     uint32_t sum = 0;// need 32 bits to hold the running sum because adding multiple 16-bit values can exceed 16 bits.
@@ -82,6 +120,28 @@ uint16_t checksum(uint8_t *data, int length){
         sum = (sum>>16) + (sum & 0xFFFF);
     }
     return ~sum;
+}
+
+
+//constructor for logical ether struct
+ether *mkether(ethertype type, mac *source, mac *dest){
+  
+    uint16_t size; 
+    ether *e; 
+
+    if(!type || !source || !dest) return (ether *)0;
+
+    size = sizeof(ether);
+    e = (ether *)malloc(size);
+    assert(e);
+    memset(e, 0, size);
+
+    e->src = *source;
+    e->dst = *dest;
+    e->protocol = type;
+    e->payload = (ip *)0;
+
+    return e;
 }
 
 //constructor for logical ip struct
@@ -142,6 +202,7 @@ icmp *mkicmp(type kind, const uint8_t *data, uint16_t size, uint16_t id, uint16_
 
     return p;
 }
+
 
 //eval_icmp
 uint8_t *eval_icmp(icmp *pkt){
@@ -277,6 +338,42 @@ uint8_t *evalip(ip *pkt){
     return ret;
 }
 
+uint8_t *evalether(ether *e){
+    rawether raw_ether;       /* wire-format struct — what actually goes on the wire */
+    uint8_t *ip_bytes;        /* raw bytes returned by evalip() */
+    uint8_t *p, *ret;         /* p: write cursor, ret: start of buffer to return */
+    uint16_t size;            /* total frame size: ether header + IP + ICMP + payload */
+
+    if(!e) return (uint8_t *)0;
+
+    /* populate wire-format Ethernet header from logical struct */
+    raw_ether.src = e->src;
+    raw_ether.dst = e->dst;
+    raw_ether.type = htons(e->protocol);  /* EtherType is a 16-bit big-endian wire field */
+
+    /* no ihl needed — sizeof(rawip) == ihl*4 == 20 bytes, no options */
+    size = sizeof(rawether) + sizeof(rawip) + sizeof(rawicmp) + e->payload->payload->size;
+
+    p = (uint8_t *)malloc(size);
+    ret = p;
+    assert(p);
+    memset(p, 0, size);
+
+    /* copy Ethernet header first, then advance cursor past it */
+    memcpy(p, &raw_ether, sizeof(rawether));
+    p += sizeof(rawether);
+
+    /* let evalip() handle IP+ICMP bytes — no checksum needed at Ethernet layer */
+    ip_bytes = evalip(e->payload);
+    if(ip_bytes){
+        memcpy(p, ip_bytes, sizeof(rawip) + sizeof(rawicmp) + e->payload->payload->size);
+        free(ip_bytes);
+    }
+
+    return ret;
+}
+
+
 void show_icmp(uint8_t *id, icmp *pkt){
     if(!pkt) return;
 
@@ -331,48 +428,108 @@ void showip(uint8_t *id, ip *pkt){
     return;
 }
 
+void show_ether(uint8_t *id, ether *e){
+    uint16_t n;
+    if(!e) return;
+
+    if(e->payload->payload){
+        n = sizeof(rawether) + sizeof(rawicmp) + sizeof(rawip)+ e->payload->payload->size;
+    } else{
+        n = sizeof(rawether);
+    }
+
+    printf("(e *)%s = {\n", (char *)id);
+    printf("  size:\t %d bytes total\n", (int)n);
+    printf("  protocol:\t 0x%.02hhx\n", (char)e->protocol);
+    
+
+    printf("mac src:\t%02x:%02x:%02x:%02x:%02x:%02x\n",
+                (uint8_t)(e->src.addr & 0xFF),
+                (uint8_t)((e->src.addr >> 8) & 0xFF),
+                (uint8_t)((e->src.addr >> 16) & 0xFF),
+                (uint8_t)((e->src.addr >> 24) & 0xFF),
+                (uint8_t)((e->src.addr >> 32) & 0xFF),
+                (uint8_t)((e->src.addr >> 40) & 0xFF));
+
+    printf("mac dst:\t%02x:%02x:%02x:%02x:%02x:%02x\n",
+                (uint8_t)(e->dst.addr & 0xFF),
+                (uint8_t)((e->dst.addr >> 8) & 0xFF),
+                (uint8_t)((e->dst.addr >> 16) & 0xFF),
+                (uint8_t)((e->dst.addr >> 24) & 0xFF),
+                (uint8_t)((e->dst.addr >> 32) & 0xFF),
+                (uint8_t)((e->dst.addr >> 40) & 0xFF));
+
+    printf("}\n");
+
+    if (e->payload->payload)
+        showip("payload", e->payload->payload);
+
+    return;
+}
+
 void free_ip(ip *pkt){
     free(pkt);
 }
+
+void free_ether(ether *e){
+    if(!e) return;
+    free_icmp(e->payload->payload);
+    free_ip(e->payload);
+    free(e);
+}
+
 
 /*a convenience function that creates and configures the raw socket, 
 returning the socket file descriptor. Everything that needs to happen 
 once before packets can be sent or received lives here.*/
 uint32_t setup(){
-   uint32_t s, one;
+   uint32_t s;
    signed int tmp;
    struct timeval tv;
 
    tv.tv_sec = 2;
    tv.tv_usec = 0;
 
-   one = (uint32_t)1;
-
-   //1 passed to socket() is IPPROTO_ICMP as a raw number
-   tmp = socket(AF_INET, SOCK_RAW, 1);
+   //Ethertype value passed for ip packet to receive ipv4 packets
+   tmp = socket(AF_PACKET, SOCK_RAW, htons(tIP));
    
    if(tmp>2) s = (uint32_t)tmp;
    else s = (uint32_t)0;
 
-/*SOL_IP means the option applies at the IP layer. 
-IP_HDRINCL with value 1 tells the kernel - 
-"I'm providing the complete IP header myself, don't add one." 
-Without this, the OS would prepend its own IP header on top of 
-the one in evalip(), producing a malformed double-header packet.*/   
-   setsockopt( (int)s, SOL_IP, IP_HDRINCL, (unsigned int *)&one, sizeof(uint32_t) );
 
    setsockopt( (int)s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(struct timeval) );
 
    return s;
 }
 
-bool sendip(uint32_t s, ip *pkt){
+//hand the kernel a form with the interface name filled in, 
+//it stamps the index on it and hands it back.
+int if2idx(uint32_t s, const char *ifname){
+
+//ifreq is a standard Linux struct used as a two-way 
+//communication channel with the kernel via ioctl()    
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+
+//We are filling in our side of the request — "kernel, I want info about the interface named ifname." 
+//IFNAMSIZ is the max interface name length (16 bytes). The -1 leaves room for the null terminator.
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+//This is the actual kernel call. SIOCGIFINDEX means "Socket IOctl Get Interface Index." 
+//We hand ifr in with the name filled, the kernel writes the index back into ifr.ifr_ifindex.
+    
+    if( ioctl( (int)s, SIOCGIFINDEX /*get interface index*/, &ifr ) < 0) return -1;
+
+    return ifr.ifr_ifindex;
+}
+
+bool sendframe(uint32_t s, ether *frames){
     uint8_t *raw;
     uint16_t n;
     signed int ret;
-    struct sockaddr_in sock;
+    struct sockaddr_ll sock;
 
-    if(!s || !pkt) return false;
+    if(!s || !frames) return false;
 
 /*  Zeroes the sockaddr_in struct before filling it in. This is important because uninitialized 
     struct fields contain garbage - the OS might misinterpret them when routing the packet.*/
@@ -382,11 +539,12 @@ bool sendip(uint32_t s, ip *pkt){
    and produces a single flat byte buffer containing the complete wire-format packet: 
    IP header, then ICMP header, then ICMP payload, all contiguous. 
    raw now points to those bytes, ready to hand directly to sendto().*/    
-    raw = evalip(pkt);
+    raw = evalether(frames);
 
-    n = sizeof(rawip) + sizeof(rawicmp) + pkt->payload->size;
+    n = sizeof(rawether) + sizeof(rawip) + sizeof(rawicmp) + frames->payload->payload->size;
 
-    sock.sin_addr.s_addr = (in_addr_t)pkt->dst;
+//frames->dst is a mac struct. sll_ifindex needs an integer interface index. 
+    sock.sll_ifindex = if2idx(s, "enp0s3");
 
     ret = sendto( (int)s, raw, (int)n, 0 /*MSG_DONTWAIT*/, (const struct sockaddr *)&sock, sizeof(sock) );
     free(raw);
@@ -395,12 +553,9 @@ bool sendip(uint32_t s, ip *pkt){
     else return true;
 }
 
-ip *recvip(uint32_t s){
-    uint8_t buf[1600];
+ip *recvip(uint8_t *buf, uint16_t n){
     ip *ip_pkt;
     rawip *raw_ip;
-    signed int ret;
-    uint16_t n;
     uint8_t src[16], dst[16];
     uint16_t id;
     type kind;
@@ -411,18 +566,9 @@ ip *recvip(uint32_t s){
     uint16_t icmp_checksum;
     uint16_t len;
     uint8_t *tmp;
-    
-    if(!s) return (ip *)0;
-
-    //setting up the receive buffer
-    memset(&buf, 0, 1600);
-    ret = recvfrom((int)s, &buf, 1599, 0, 0, 0);
-
-    if(ret<0)return (ip *)0;
-    else n = (uint16_t)ret;
 
     //cast to rawip* to read IP header fields
-    raw_ip = (rawip *)&buf;
+    raw_ip = (rawip *)buf;
     id = ntohs(raw_ip->id);
 
     //Extracting source and destination addresses
@@ -476,7 +622,7 @@ ip *recvip(uint32_t s){
     else if(!raw_icmp->Type && !raw_icmp->code) icmpkind = echoreply;
     else icmpkind = unassigned;
 
-    if(icmpkind == unassigned) return recvip(s);//keep receiving until you get something meaningful
+    if(icmpkind == unassigned) return (ip *)0;
 
     //Verifying the ICMP checksum
     icmp_checksum = checksum((uint8_t *) raw_icmp, n);
@@ -486,7 +632,7 @@ ip *recvip(uint32_t s){
     }
     
     //Extracting the ICMP payload and building the logical ICMP struct
-    n = n-sizeof(rawicmp);
+    n = n - sizeof(rawicmp);
     uint8_t *payload = NULL;
     if(n > 0){
         payload = malloc(n);
@@ -501,6 +647,41 @@ ip *recvip(uint32_t s){
     else ip_pkt->payload = icmp_pkt;
 
     return ip_pkt;
+}
+
+ether *recv_frame(uint32_t s){
+    uint8_t buf[1600];
+    signed int ret;
+    uint16_t n;
+    rawether *raw_ether;
+    ether *e;
+
+    if(!s) return (ether *)0;
+
+    //setting up the receive buffer
+    memset(&buf, 0, 1600);
+    ret = recvfrom((int)s, &buf, 1599, 0, 0, 0);
+
+    if(ret<0)return (ether *)0;
+    else n = (uint16_t)ret;
+
+    //cast to rawether* to read ethernet header
+    raw_ether = (rawether *)&buf;
+
+    if(raw_ether->type != htons(tIP)) return NULL;
+
+    //building logial ethernet struct
+    e = mkether(raw_ether->type, &raw_ether->src, &raw_ether->dst);
+
+    n = n-sizeof(rawether);
+    if(!n){
+        e->payload = (ip *)0;
+    }
+
+    //advancing past ethernet header
+    e->payload = recvip(buf+sizeof(rawether), n);
+
+    return e;
 }
 
 int main(){
